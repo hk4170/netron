@@ -1560,6 +1560,10 @@ _.StringRef = class {
 _.Type = class {
 
     constructor(value) {
+        if (value && value instanceof _.RankedTensorType === false && value.startsWith('tensor<')) {
+            // Do not remove. Investigate why RankedTensorType is not getting parsed.
+            throw new mlir.Error(`Invalid type '${value}'.`);
+        }
         this._value = value;
     }
 
@@ -4257,6 +4261,10 @@ _.OperationParser = class extends _.Parser {
 
 _.AsmParser = class extends _.Parser {
 
+    getNameLoc() {
+        return this.nameLoc;
+    }
+
     parseKeyword(keyword) {
         this.expect('id', keyword);
     }
@@ -4596,7 +4604,7 @@ _.OpAsmParser = class extends _.AsmParser {
             let tiedOperandIndex = -1;
             const tiedResult = this.parseOptionalOperand();
             if (tiedResult) {
-                tiedOperandIndex = _.OpAsmParser.findTiedOperand(tiedResult, operands);
+                tiedOperandIndex = this.findTiedOperand(tiedResult, operands);
                 if (this.accept('id', 'as')) {
                     type = this.parseType();
                 } else if (tiedOperandIndex >= 0 && tiedOperandIndex < operandTypes.length) {
@@ -4617,15 +4625,15 @@ _.OpAsmParser = class extends _.AsmParser {
             tiedOperands.push(...tiedOperandIndices);
         }
     }
-};
 
-_.OpAsmParser.findTiedOperand = function(tiedResult, operands) {
-    for (let i = 0; i < operands.length; i++) {
-        if (operands[i].name === tiedResult.name && operands[i].number === tiedResult.number) {
-            return i;
+    findTiedOperand(tiedResult, operands) {
+        for (let i = 0; i < operands.length; i++) {
+            if (operands[i].name === tiedResult.name && operands[i].number === tiedResult.number) {
+                return i;
+            }
         }
+        return -1;
     }
-    return -1;
 };
 
 _.OpAsmParser.Argument = class {
@@ -4652,6 +4660,7 @@ _.CustomOpAsmParser = class extends _.OpAsmParser {
         super(parser.state);
         this.resultIDs = resultIDs || [];
         this.parser = parser;
+        this.nameLoc = parser.getToken().loc.copy();
     }
 
     parseOperation() {
@@ -4791,6 +4800,7 @@ _.CustomDialectAsmParser = class extends _.DialectAsmParser {
         super(parser.state);
         this.fullSpec = fullSpec;
         this.parser = parser;
+        this.nameLoc = parser.getToken().loc.copy();
     }
 };
 
@@ -7036,7 +7046,7 @@ _.DialectContext = class {
         this._dialects.set('affine', new _.AffineDialect(operations));
         this._dialects.set('asuka', new _.AsukaDialect(operations));
         this._dialects.set('arith', new _.ArithDialect(operations));
-        this._dialects.set('async', new _.AsyncDialect(operations));
+        this._dialects.set('async', new _.async.AsyncDialect(operations));
         this._dialects.set('cf', new _.CFDialect(operations));
         this._dialects.set('emitc', new _.EmitCDialect(operations));
         this._dialects.set('complex', new _.Dialect(operations, 'complex'));
@@ -7117,7 +7127,7 @@ _.DialectContext = class {
         this._dialects.set('irdl', new _.IRDLDialect(operations));
         this._dialects.set('transform', new _.TransformDialect(operations));
         this._dialects.set('wasmssa', new _.WasmSSADialect(operations));
-        this._dialects.set('spirv', new _.SPIRVDialect(operations));
+        this._dialects.set('spirv', new _.spirv.SPIRVDialect(operations));
         this._dialects.set('spv', this._dialects.get('spirv'));
         this._dialects.set('toy', new _.ToyDialect(operations));
         this._dialects.set('top', new _.Dialect(operations, 'top'));
@@ -7373,9 +7383,10 @@ _.Dialect = class {
             case 'AnyIRModule': return new _.Type('!transform.any_op');
             case 'Async_CoroHandleType': return new _.Type('!async.coro.handle');
             case 'Async_CoroIdType': return new _.Type('!async.coro.id');
-            case 'Async_GroupType': return new _.Type('!async.group');
-            case 'Async_TokenType': return new _.Type('!async.token');
-            case 'Async_ValueType': return new _.Type('!async.value<memref<?xf32>>');
+            case 'Async_CoroStateType': return new _.Type('!async.coro.state');
+            case 'Async_GroupType': return new _.async.GroupType();
+            case 'Async_TokenType': return new _.async.TokenType();
+            case 'Async_ValueType': return new _.async.ValueType(new _.MemRefType([-1], new _.Type('f32')));
             case 'BF16': return new _.Type('bf16');
             case 'BoolType': return new _.Type('!smt.bool');
             case 'CanonicalLoopInfoType': return new _.Type('!omp.canonical_loop_info');
@@ -7425,6 +7436,7 @@ _.Dialect = class {
             case 'Ifrt_ArrayType': return new _.Type('!ifrt.array');
             case 'Ifrt_ControlType': return new _.Type('!ifrt.control');
             case 'Index': return new _.IndexType();
+            case 'IntType': return new _.Type('!smt.int');
             case 'IRDL_AttributeType': return new _.Type('!irdl.attribute');
             case 'IRDL_RegionType': return new _.Type('!irdl.region');
             case 'IREE_Input_GlobalRefAttr': return new _.Type('!iree_input.global.ref');
@@ -7484,6 +7496,7 @@ _.Dialect = class {
             case 'Shape_SizeType': return new _.Type('!shape.size');
             case 'Shape_ValueShapeType': return new _.Type('!shape.value_shape');
             case 'Shape_WitnessType': return new _.Type('!shape.witness');
+            case 'StaticShapeTensorOf': return new _.UnrankedTensorType(this.createBuildableType(constraint.args[0][0]));
             case 'SI16': return new _.IntegerType('si16');
             case 'SI32': return new _.IntegerType('si32');
             case 'SI64': return new _.IntegerType('si64');
@@ -7565,7 +7578,6 @@ _.Dialect = class {
             }
             return;
         }
-        const resultNames = metadata.results.map((r) => r.name);
         const operandNames = metadata.operands?.map((o) => o.name) || [];
         // Build result types in metadata order
         const orderedTypes = [];
@@ -7704,11 +7716,11 @@ _.Dialect = class {
                         }
                         if (resultArg && sourceArg) {
                             const sourceTypes = [];
-                            // Check if source is in vars (another parsed result)
-                            if (resultNames.includes(sourceArg) && vars.has(sourceArg) && vars.get(sourceArg).types.length > 0) {
+                            // Check if source is in vars (parsed result or operand type from type($var))
+                            if (vars.has(sourceArg) && vars.get(sourceArg).types.length > 0) {
                                 sourceTypes.push(...vars.get(sourceArg).types);
                             }
-                            // Check if source is an operand
+                            // Check if source is an operand - fall back to operand's value type
                             if (sourceTypes.length === 0) {
                                 const operands = metadata.operands || [];
                                 let actualOperandIdx = 0;
@@ -7736,7 +7748,31 @@ _.Dialect = class {
                             }
                             if (sourceTypes.length > 0) {
                                 for (const sourceType of sourceTypes) {
-                                    const resultType = this.applyTypeTransformer(sourceType, transformer);
+                                    let resultType = sourceType;
+                                    if (transformer === '::getI1SameShape($_self)') {
+                                        if (sourceType instanceof _.VectorType) {
+                                            resultType = new _.VectorType(sourceType.dimensions, new _.IntegerType('i1'), sourceType.scalableDims);
+                                        } else if (sourceType instanceof mlir.TensorType) {
+                                            resultType = new mlir.TensorType(sourceType.dimensions, new _.IntegerType('i1'));
+                                        } else {
+                                            resultType = new _.IntegerType('i1');
+                                        }
+                                    } else if (transformer && transformer.includes('.getElementType()')) {
+                                        if (sourceType && sourceType.elementType) {
+                                            resultType = sourceType.elementType;
+                                        } else {
+                                            throw new mlir.Error(`Cannot get element type.`);
+                                        }
+                                    } else if (transformer && transformer.includes('getPointeeType')) {
+                                        if (sourceType && sourceType.pointeeType) {
+                                            resultType = sourceType.pointeeType;
+                                        } else {
+                                            throw new mlir.Error(`Cannot get pointee type.`);
+                                        }
+                                    } else if (transformer && transformer.includes('getValAndBoolStructType')) {
+                                        const typeStr = sourceType.toString ? sourceType.toString() : String(sourceType);
+                                        resultType = new _.Type(`!llvm.struct<(${typeStr}, i1)>`);
+                                    }
                                     if (resultType) {
                                         orderedTypes.push(resultType);
                                         resolved = true;
@@ -7758,6 +7794,21 @@ _.Dialect = class {
                     }
                 }
             }
+            // For single variadic result matching single variadic operand with same element type, infer from operands
+            if (!resolved && resultInfo.type?.name === 'Variadic' &&
+                metadata.results?.length === 1 && metadata.operands?.length === 1) {
+                const resultElementType = resultInfo.type.args?.[0]?.name;
+                const operandInfo = metadata.operands[0];
+                if (operandInfo.type?.name === 'Variadic' &&
+                    operandInfo.type.args?.[0]?.name === resultElementType) {
+                    for (const operand of op.operands) {
+                        if (operand.type) {
+                            orderedTypes.push(operand.type);
+                        }
+                    }
+                    resolved = orderedTypes.length > 0;
+                }
+            }
             // Fallback: try buildable type (skip for variadic/optional)
             if (!resolved && resultInfo.type && !isVariadicOrOptional) {
                 const type = this.createBuildableType(resultInfo.type);
@@ -7771,48 +7822,6 @@ _.Dialect = class {
             op.types.length = 0;
             op.addTypes(orderedTypes);
         }
-    }
-
-    applyTypeTransformer(sourceType, transformer) {
-        if (transformer === '$_self') {
-            return sourceType;
-        }
-        if (transformer === '::getI1SameShape($_self)') {
-            if (sourceType instanceof _.VectorType) {
-                return new _.VectorType(sourceType.dimensions, new _.IntegerType('i1'), sourceType.scalableDims);
-            } else if (sourceType instanceof mlir.TensorType) {
-                return new mlir.TensorType(sourceType.dimensions, new _.IntegerType('i1'));
-            }
-            return new _.IntegerType('i1');
-        }
-        if (transformer && transformer.includes('.getElementType()')) {
-            if (sourceType && sourceType.elementType) {
-                return sourceType.elementType;
-            }
-            if (sourceType) {
-                const typeStr = sourceType.toString ? sourceType.toString() : String(sourceType);
-                const match = typeStr.match(/<[^>]*x([a-z]+\d*|f\d+|bf\d+|i\d+|si\d+|ui\d+|index)>/i);
-                if (match) {
-                    return new _.Type(match[1]);
-                }
-            }
-        }
-        if (transformer && transformer.includes('getPointeeType')) {
-            const typeStr = sourceType.toString ? sourceType.toString() : String(sourceType);
-            const tensorPtrMatch = typeStr.match(/^tensor<(.+)x!tt\.ptr<([^>]+)>>$/);
-            if (tensorPtrMatch) {
-                return new _.Type(`tensor<${tensorPtrMatch[1]}x${tensorPtrMatch[2]}>`);
-            }
-            const ptrMatch = typeStr.match(/!tt\.ptr<([^>]+)>/);
-            if (ptrMatch) {
-                return new _.Type(ptrMatch[1]);
-            }
-        }
-        if (transformer && transformer.includes('getValAndBoolStructType')) {
-            const typeStr = sourceType.toString ? sourceType.toString() : String(sourceType);
-            return new _.Type(`!llvm.struct<(${typeStr}, i1)>`);
-        }
-        return sourceType;
     }
 
     parseDirective(directive, parser, op, opInfo, directives, i, vars) {
@@ -9611,23 +9620,15 @@ _.HLODialect = class extends _.Dialect {
             } else {
                 parser.resolveOperands(allUnresolved, allUnresolved.map(() => null), result.operands);
             }
-
-            // Create a region with the inner operation
             const region = { blocks: [] };
             const block = { operations: [], arguments: [] };
-            let elementType = null;
+            let tensorType = null;
             if (result.operands.length > 0 && result.operands[0].type) {
-                const tensorMatch = result.operands[0].type.toString().match(/tensor<.*?x([^>]+)>/);
-                if (tensorMatch) {
-                    [, elementType] = tensorMatch;
-                } else {
-                    const scalarMatch = result.operands[0].type.toString().match(/tensor<([^>]+)>/);
-                    if (scalarMatch) {
-                        [, elementType] = scalarMatch;
-                    }
+                const operandType = result.operands[0].type;
+                if (operandType instanceof _.RankedTensorType || operandType instanceof _.UnrankedTensorType) {
+                    tensorType = new _.RankedTensorType([], operandType.elementType);
                 }
             }
-            const tensorType = elementType ? new _.Type(`tensor<${elementType}>`) : null;
             block.arguments.push({ value: '%lhs', type: tensorType });
             block.arguments.push({ value: '%rhs', type: tensorType });
             const innerOp = new _.OperationState(null, innerOpName);
@@ -9696,27 +9697,6 @@ _.StableHLODialect = class extends _.HLODialect {
     constructor(operations) {
         super(operations, 'stablehlo');
         this.registerCustomDirective('ExponentMantissa', this.parseExponentMantissa.bind(this));
-    }
-
-    // custom<ExponentMantissa>($exponent_bits, $mantissa_bits)
-    parseExponentMantissa(parser, op, exponentAttr, mantissaAttr) {
-        const keyword = parser.expect('id');
-        const match = /^e(\d+)m(\d+)$/.exec(keyword);
-        if (!match) {
-            throw new mlir.Error(`Expected exponent mantissa in format e#m#, got '${keyword}'`);
-        }
-        const exponent = parseInt(match[1], 10);
-        const mantissa = parseInt(match[2], 10);
-        op.addAttribute(exponentAttr, exponent);
-        op.addAttribute(mantissaAttr, mantissa);
-    }
-
-    parseType(parser, dialect) {
-        const typeName = parser.parseOptionalKeyword();
-        if (typeName === 'token') {
-            return new _.Type(`!${dialect}.token`);
-        }
-        return null;
     }
 
     parseOperation(parser, result) {
@@ -9798,6 +9778,26 @@ _.StableHLODialect = class extends _.HLODialect {
             return super.parseReduceOp(parser, result, (dims) => dims, 'stablehlo.return');
         }
         return super.parseOperation(parser, result);
+    }
+
+    parseType(parser, dialect) {
+        const mnemonic = parser.parseOptionalKeyword();
+        if (mnemonic === 'token') {
+            return new _.Type(`!${dialect}.token`);
+        }
+        throw new mlir.Error(`Unknown '${dialect}' type '${mnemonic}' ${parser.getNameLoc()}`);
+    }
+
+    parseExponentMantissa(parser, op, exponentAttr, mantissaAttr) {
+        const keyword = parser.expect('id');
+        const match = /^e(\d+)m(\d+)$/.exec(keyword);
+        if (!match) {
+            throw new mlir.Error(`Expected exponent mantissa in format e#m#, got '${keyword}'`);
+        }
+        const exponent = parseInt(match[1], 10);
+        const mantissa = parseInt(match[2], 10);
+        op.addAttribute(exponentAttr, exponent);
+        op.addAttribute(mantissaAttr, mantissa);
     }
 };
 
@@ -10275,9 +10275,11 @@ _.MemRefDialect = class extends _.Dialect {
             if (result.operands.length > 0 && result.operands[0].type) {
                 const memrefType = result.operands[0].type;
                 // Convert memref type to tensor type
-                const typeStr = memrefType.toString ? memrefType.toString() : String(memrefType);
-                const tensorTypeStr = typeStr.replace(/^memref</, 'tensor<').replace(/,\s*[^>]+>$/, '>');
-                result.addTypes([new _.Type(tensorTypeStr)]);
+                if (memrefType instanceof _.MemRefType) {
+                    result.addTypes([new _.RankedTensorType(memrefType.shape, memrefType.elementType, null)]);
+                } else if (memrefType instanceof _.UnrankedMemRefType) {
+                    result.addTypes([new _.UnrankedTensorType(memrefType.elementType)]);
+                }
             }
             return true;
         }
@@ -12319,7 +12321,7 @@ _.FlowDialect = class extends _.IREEDialect {
                             // Look up type from tied operand using unresolvedArguments
                             // unresolvedArguments contains UnresolvedOperand objects with .name and .number
                             const operands = unresolvedArguments || [];
-                            const tiedOperandIndex = _.OpAsmParser.findTiedOperand(tiedResult, operands);
+                            const tiedOperandIndex = parser.findTiedOperand(tiedResult, operands);
                             if (tiedOperandIndex >= 0 && tiedOperandIndex < operandTypes.length) {
                                 const type = operandTypes[tiedOperandIndex];
                                 if (type) {
@@ -14741,7 +14743,32 @@ _.ShardDialect = class extends _.Dialect {
     }
 };
 
-_.SPIRVDialect = class extends _.Dialect {
+_.spirv = {};
+
+_.spirv.PointerType = class extends _.Type {
+
+    constructor(pointeeType, storageClass) {
+        super(null);
+        this.pointeeType = pointeeType;
+        this.storageClass = storageClass;
+    }
+
+    static parse(parser) {
+        parser.expect('<');
+        const pointeeType = parser.parseType();
+        parser.expect(',');
+        const storageClass = parser.parseOptionalKeyword() || parser.expect('id');
+        parser.expect('>');
+        return new _.spirv.PointerType(pointeeType, storageClass);
+    }
+
+    toString() {
+        const pointeeStr = this.pointeeType?.toString ? this.pointeeType.toString() : this.pointeeType;
+        return `!spirv.ptr<${pointeeStr}, ${this.storageClass}>`;
+    }
+};
+
+_.spirv.SPIRVDialect = class extends _.Dialect {
 
     constructor(operations) {
         super(operations, 'spirv');
@@ -14845,6 +14872,10 @@ _.SPIRVDialect = class extends _.Dialect {
         let typeName = parser.parseOptionalKeyword();
         if (!typeName) {
             return null;
+        }
+        // Handle ptr type specially to properly parse pointee type
+        if (typeName === 'ptr' && parser.match('<')) {
+            return _.spirv.PointerType.parse(parser);
         }
         // Handle sub-dialect types like arm.tensor, KHR.CooperativeMatrix, etc.
         while (parser.accept('.')) {
@@ -16339,46 +16370,80 @@ _.AsukaDialect = class extends _.Dialect {
     }
 };
 
-_.AsyncDialect = class extends _.Dialect {
+_.async = {};
+
+_.async.TokenType = class extends _.Type {
+
+    constructor() {
+        super(null);
+    }
+
+    toString() {
+        return '!async.token';
+    }
+};
+
+_.async.GroupType = class extends _.Type {
+
+    constructor() {
+        super(null);
+    }
+
+    toString() {
+        return '!async.group';
+    }
+};
+
+_.async.ValueType = class extends _.Type {
+
+    constructor(valueType) {
+        super(null);
+        this.valueType = valueType;
+    }
+
+    toString() {
+        const inner = this.valueType?.toString ? this.valueType.toString() : this.valueType;
+        return `!async.value<${inner}>`;
+    }
+
+    static parse(parser) {
+        if (parser.accept('<')) {
+            const innerType = parser.parseType();
+            parser.expect('>');
+            return new _.async.ValueType(innerType);
+        }
+        return parser.parseType();
+    }
+};
+
+_.async.AsyncDialect = class extends _.Dialect {
 
     constructor(operations) {
         super(operations, 'async');
         this.registerCustomDirective('AwaitResultType', this.parseAwaitResultType.bind(this));
-        this.registerCustomType('Async_ValueType', this.parseValueTypeShorthand.bind(this));
+        this.registerCustomType('Async_ValueType', (parser) => _.async.ValueType.parse(parser));
     }
 
     parseType(parser, dialect) {
-        const typeName = parser.parseOptionalKeyword();
-        if (!typeName) {
-            return null;
+        const mnemonic = parser.parseOptionalKeyword();
+        if (mnemonic === 'coro.handle' || mnemonic === 'coro.id' || mnemonic === 'coro.state') {
+            return new _.Type(`!${dialect}.${mnemonic}`);
         }
-        let type = `!${dialect}.${typeName}`;
-        // Handle coro.* types (coro.id, coro.handle, coro.state)
-        if (typeName === 'coro') {
-            if (parser.accept('.')) {
-                const subType = parser.parseOptionalKeyword();
-                if (subType) {
-                    type += `.${subType}`;
-                }
+        if (mnemonic === 'token') {
+            return new _.async.TokenType();
+        }
+        if (mnemonic === 'group') {
+            return new _.async.GroupType();
+        }
+        if (mnemonic === 'value') {
+            if (parser.accept('<')) {
+                const innerType = parser.parseType();
+                parser.expect('>');
+                return new _.async.ValueType(innerType);
             }
-            return new _.Type(type);
+            return new _.async.ValueType(null);
         }
-        const simpleTypes = ['token', 'group'];
-        if (simpleTypes.includes(typeName)) {
-            return new _.Type(type);
-        }
-        if (typeName === 'value') {
-            if (parser.match('<')) {
-                const content = parser.skip('<');
-                type += content;
-            }
-            return new _.Type(type);
-        }
-        // Fallback for unknown async types
-        if (parser.match('<')) {
-            type += parser.skip('<');
-        }
-        return new _.Type(type);
+        throw new mlir.Error(`Unknown '${dialect}' type '${mnemonic}' ${parser.getNameLoc()}`);
     }
 
     parseOperation(parser, result) {
@@ -16427,7 +16492,7 @@ _.AsyncDialect = class extends _.Dialect {
                 valueTypes.push(parser.parseType());
             }
         }
-        result.addTypes([new _.Type('!async.token')]);
+        result.addTypes([new _.async.TokenType()]);
         result.addTypes(valueTypes);
         parser.parseOptionalAttrDictWithKeyword(result.attributes);
         if (parser.match('{')) {
@@ -16462,22 +16527,9 @@ _.AsyncDialect = class extends _.Dialect {
         if (Array.isArray(operandTypeArg)) {
             operandTypeArg.push(operandType);
         }
-        const operandTypeStr = operandType ? operandType.toString() : '';
-        if (operandTypeStr && operandTypeStr.startsWith('!async.value')) {
-            const match = operandTypeStr.match(/!async\.value<(.+)>/);
-            if (match) {
-                const [, innerType] = match;
-                op.addTypes([new _.Type(innerType)]);
-            }
+        if (operandType instanceof _.async.ValueType && operandType.valueType) {
+            op.addTypes([operandType.valueType]);
         }
-    }
-
-    parseValueTypeShorthand(parser) {
-        if (parser.match('<')) {
-            const content = parser.skip('<');
-            return new _.Type(`!async.value${content}`);
-        }
-        return parser.parseType();
     }
 };
 
@@ -20863,7 +20915,7 @@ _.TFExecutorDialect = class extends _.Dialect {
             const type = parser.parseType();
             parser.resolveOperand(unresolvedData, type, result.operands);
             parser.resolveOperand(unresolvedIndex, new _.RankedTensorType([], new _.IntegerType('i32'), null), result.operands);
-            parser.resolveOperands(unresolvedControlInputs, unresolvedControlInputs.map(() => '!tf_executor.control'), result.operands);
+            parser.resolveOperands(unresolvedControlInputs, unresolvedControlInputs.map(() => new _.Type('!tf_executor.control')), result.operands);
             for (let i = 0; i < numOuts; i++) {
                 result.addTypes([type]);
             }
@@ -20925,7 +20977,7 @@ _.TFExecutorDialect = class extends _.Dialect {
             parser.resolveOperands(unresolvedOperands, type.inputs, result.operands);
             result.addTypes(type.results);
         } else {
-            const resolveTypes = unresolvedOperands.map((_, i) => i === 0 ? type : new _.Type('!tf_executor.control'));
+            const resolveTypes = unresolvedOperands.map((v, i) => i === 0 ? type : new _.Type('!tf_executor.control'));
             parser.resolveOperands(unresolvedOperands, resolveTypes, result.operands);
             result.addTypes([type]);
             result.addTypes([new _.Type('!tf_executor.control')]);
@@ -23152,6 +23204,17 @@ _.triton.PointerType = class extends _.Type {
         this.addressSpace = addressSpace || 1;
     }
 
+    static parse(parser) {
+        parser.expect('<');
+        const pointeeType = parser.parseType();
+        let addressSpace = 1;
+        if (parser.accept(',')) {
+            addressSpace = parseInt(parser.expect('int'), 10);
+        }
+        parser.expect('>');
+        return new _.triton.PointerType(pointeeType, addressSpace);
+    }
+
     toString() {
         const pointeeStr = this.pointeeType?.toString ? this.pointeeType.toString() : this.pointeeType;
         if (this.addressSpace && this.addressSpace !== 1) {
@@ -23165,9 +23228,9 @@ _.triton.TritonDialect = class extends _.Dialect {
 
     constructor(operations) {
         super(operations, 'tt');
-        this.registerCustomType('TT_Ptr', this.parsePtr.bind(this));
+        this.registerCustomType('TT_Ptr', (parser) => _.triton.PointerType.parse(parser));
         this.registerCustomType('TT_TensorDescType', this.parseTensorDescType.bind(this));
-        this.registerCustomType('TT_TensorPtr', this.parseTensorPtr.bind(this));
+        this.registerCustomType('TT_TensorPtr', (parser) => _.triton.PointerType.parse(parser));
     }
 
     parseType(parser, dialect) {
@@ -23177,7 +23240,7 @@ _.triton.TritonDialect = class extends _.Dialect {
         }
         // Handle ptr type specifically to properly parse pointee type
         if (typeName === 'ptr' && parser.match('<')) {
-            return this.parsePtr(parser);
+            return _.triton.PointerType.parse(parser);
         }
         let type = `!${dialect}.${typeName}`;
         if (parser.match('<')) {
@@ -23193,24 +23256,6 @@ _.triton.TritonDialect = class extends _.Dialect {
             return true;
         }
         return super.parseOperation(parser, result);
-    }
-
-    parsePtr(parser) {
-        if (parser.match('<')) {
-            parser.expect('<');
-            const pointeeType = parser.parseType();
-            let addressSpace = 1;
-            if (parser.accept(',')) {
-                addressSpace = parseInt(parser.expect('int'), 10);
-            }
-            parser.expect('>');
-            return new _.triton.PointerType(pointeeType, addressSpace);
-        }
-        return null;
-    }
-
-    parseTensorPtr(parser) {
-        return this.parsePtr(parser);
     }
 
     parseTensorDescType(parser) {

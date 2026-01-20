@@ -939,8 +939,21 @@ tablegen.Record = class {
                 if (casesArg && casesArg.type === 'list' && Array.isArray(casesArg.value)) {
                     const cases = [];
                     for (const caseValue of casesArg.value) {
-                        // Each case is a def reference
-                        if (caseValue.type === 'def' && typeof caseValue.value === 'string') {
+                        // Each case can be either a DAG or a def reference
+                        if (caseValue.type === 'dag' && caseValue.value) {
+                            // DAG format: I32EnumAttrCase<"symbol", value>
+                            // The first operand is the symbol name
+                            const operands = caseValue.value.operands;
+                            if (operands && operands.length > 0) {
+                                const strOperand = operands[0];
+                                if (strOperand && strOperand.value) {
+                                    const str = this.evaluateValue(strOperand.value);
+                                    if (str && typeof str === 'string') {
+                                        cases.push(str);
+                                    }
+                                }
+                            }
+                        } else if (caseValue.type === 'def' && typeof caseValue.value === 'string') {
                             const caseDef = this.parser.getDef(caseValue.value) || this.parser.getClass(caseValue.value);
                             if (caseDef) {
                                 const str = caseDef.getValueAsString('str');
